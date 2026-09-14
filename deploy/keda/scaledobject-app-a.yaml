@@ -1,0 +1,81 @@
+# KEDA ScaledObject for Deployment app-a (design.md §6).
+#
+# The trigger deliberately knows nothing about warm/hot pods: it scales purely on
+# demand + a fixed overprovision term, divided by per-hot-pod capacity. The warm/hot
+# split is entirely the WarmPool reconciler's job (design.md §4.6); KEDA just picks a
+# replica count.
+#
+# Derivation (design.md §6):
+#
+#   With metricType: AverageValue, the HPA computes desiredReplicas = ceil(metricValue / threshold).
+#   metricValue = demand + (warmReplicas * podCapacityRPS)
+#   threshold   = podCapacityRPS
+#
+#   => replicas = ceil((demand + warmReplicas * podCapacityRPS) / podCapacityRPS)
+#               = ceil(demand / podCapacityRPS) + warmReplicas
+#
+# With warmReplicas=2 and podCapacityRPS=10 (this Deployment's
+# gpu-lease.llm-d.ai/warm-replicas and gpu-lease.llm-d.ai/pod-capacity-rps annotation
+# defaults — see api/v1alpha1/names.go):
+#
+#   demand=20 -> ceil(20/10) + 2 = 2 + 2 = 4  replicas (2 hot + 2 warm, steady state)
+#   demand=25 -> ceil(25/10) + 2 = 3 + 2 = 5  replicas (3 hot + 2 warm, demo step 2)
+#   demand=20 -> back to 4                    replicas (demo step 4)
+#
+# If either the Deployment's warm-replicas or pod-capacity-rps annotation is ever
+# changed from the defaults above, the two hardcoded constants in the query below
+# (the "2" = warmReplicas and the "10" = podCapacityRPS, which must also equal
+# `threshold`) MUST be updated to match, or KEDA's replica math and the controller's
+# warm-pool math will disagree.
+#
+# minReplicaCount=4 is the floor: 2 hot + 2 warm at demand=0..10 (never scales below
+# the warm floor even with the `or vector(0)` fallback below).
+#
+# `or vector(0)` is required, not decorative: gpulease_demand_rps{deployment="app-a"}
+# has no series at all until at least one app-a pod has scraped ConfigMap
+# gpu-lease-demand and exposed the metric once. Without `or vector(0)` a missing
+# series makes the Prometheus trigger return no data, which KEDA treats as an error on
+# the trigger (surfaces as the ScaledObject's Active/Ready conditions flapping and the
+# HPA showing <unknown> for the external metric) rather than "demand is currently 0".
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: app-a
+  namespace: gpu-lease-poc
+  labels:
+    app: app-a
+    app.kubernetes.io/part-of: gpu-lease-poc
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: app-a
+  minReplicaCount: 4
+  maxReplicaCount: 10
+  pollingInterval: 10
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+          - type: Pods
+            value: 2
+            periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Pods
+            value: 2
+            periodSeconds: 15
+  triggers:
+  - type: prometheus
+    name: demand-plus-overprovision
+    metricType: AverageValue
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+      query: |
+        (max by (deployment) (gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0))
+        + (2 * 10)
+      threshold: "10"
+      activationThreshold: "0"

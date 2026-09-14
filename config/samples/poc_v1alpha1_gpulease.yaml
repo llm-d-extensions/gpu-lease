@@ -1,0 +1,9 @@
+apiVersion: poc.llm-d.ai/v1alpha1
+kind: GPULease
+metadata:
+  labels:
+    app.kubernetes.io/name: gpu-lease-scaffold
+    app.kubernetes.io/managed-by: kustomize
+  name: gpulease-sample
+spec:
+  # TODO(user): Add fields here

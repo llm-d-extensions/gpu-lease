@@ -1,0 +1,15 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: app-a-gpu
+  namespace: gpu-lease-poc
+spec:
+  clusterQueue: gpu-pool
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: app-b-gpu
+  namespace: gpu-lease-poc
+spec:
+  clusterQueue: gpu-pool

@@ -1,0 +1,28 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  name: spike-wl-owner-test
+  namespace: gpu-lease-poc
+  ownerReferences:
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    name: gpu-lease-spike-owner
+    uid: 32c58650-8c5d-445d-b64b-b68159a9ceb3
+    controller: true
+    blockOwnerDeletion: false
+spec:
+  queueName: app-b-gpu
+  podSets:
+  - name: main
+    count: 1
+    template:
+      spec:
+        nodeSelector:
+          kubernetes.io/hostname: kind-wva-gpu-cluster-control-plane
+        containers:
+        - name: main
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              poc.llm-d.ai/gpu: "1"
+        restartPolicy: Never

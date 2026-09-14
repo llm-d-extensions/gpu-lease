@@ -1,0 +1,25 @@
+# Single ClusterQueue covering the poc.llm-d.ai/gpu resource, one FlavorQuota
+# per node/ResourceFlavor. nominalQuota per flavor must equal that node's
+# poc.llm-d.ai/gpu-count label (design.md §4.5) -- currently 4 on every node.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: gpu-pool
+spec:
+  namespaceSelector: {} # match all namespaces (design.md §3/§4.1)
+  queueingStrategy: BestEffortFIFO
+  resourceGroups:
+  - coveredResources: ["poc.llm-d.ai/gpu"]
+    flavors:
+    - name: h100-control-plane
+      resources:
+      - name: "poc.llm-d.ai/gpu"
+        nominalQuota: 4
+    - name: a100-worker
+      resources:
+      - name: "poc.llm-d.ai/gpu"
+        nominalQuota: 4
+    - name: mi300x-worker2
+      resources:
+      - name: "poc.llm-d.ai/gpu"
+        nominalQuota: 4

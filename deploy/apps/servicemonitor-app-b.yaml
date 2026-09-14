@@ -1,0 +1,24 @@
+# ServiceMonitor for app-b -- mirror of servicemonitor-app-a.yaml (see its comments
+# for the full rationale, in particular honorLabels: true and why "deployment" comes
+# from the app's own metrics, not from relabeling).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: app-b
+  namespace: gpu-lease-poc
+  labels:
+    app: app-b
+    app.kubernetes.io/part-of: gpu-lease-poc
+spec:
+  selector:
+    matchLabels:
+      app: app-b
+      gpu-lease.llm-d.ai/service-role: all
+  namespaceSelector:
+    matchNames:
+      - gpu-lease-poc
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 10s
+      honorLabels: true

@@ -1,0 +1,21 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  name: spike-wl-1
+  namespace: gpu-lease-poc
+spec:
+  queueName: app-a-gpu
+  podSets:
+  - name: main
+    count: 1
+    template:
+      spec:
+        nodeSelector:
+          kubernetes.io/hostname: kind-wva-gpu-cluster-worker
+        containers:
+        - name: main
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              poc.llm-d.ai/gpu: "1"
+        restartPolicy: Never

@@ -1,0 +1,17 @@
+# Demand dial for the demo (design.md §2, §5). Key = Deployment name, value = rps,
+# watched live by every pod of that Deployment (internal/workload.DemandWatcher) and
+# republished as gpulease_demand_rps -- KEDA's PromQL (deploy/keda/scaledobject-*.yaml)
+# reads it back via `max by (deployment)`.
+#
+# Starting values match design.md §2 step 1 (demand=20, capacity=10/hot pod -> 4
+# replicas, 2 hot + 2 warm). Change live with, e.g.:
+#
+#   kubectl -n gpu-lease-poc patch cm gpu-lease-demand --type merge -p '{"data":{"app-a":"25"}}'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-lease-demand
+  namespace: gpu-lease-poc
+data:
+  app-a: "20"
+  app-b: "20"

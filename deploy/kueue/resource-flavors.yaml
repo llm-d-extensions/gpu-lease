@@ -1,0 +1,31 @@
+# One ResourceFlavor per node, keyed on kubernetes.io/hostname so that pinning a
+# Workload's podSet nodeSelector to a single hostname makes exactly one flavor
+# eligible (Kueue skips flavors whose nodeLabels are incompatible with the
+# podSet's nodeSelector -- see docs/design.md §4.1 and docs/kueue-spike.md).
+#
+# gpu-count per node must match the poc.llm-d.ai/gpu-count label written by
+# hack/setup-nodes.sh (design.md §4.5). Today: control-plane=4 (H100),
+# worker=4 (A100), worker2=4 (MI300X).
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: h100-control-plane
+spec:
+  nodeLabels:
+    kubernetes.io/hostname: kind-wva-gpu-cluster-control-plane
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: a100-worker
+spec:
+  nodeLabels:
+    kubernetes.io/hostname: kind-wva-gpu-cluster-worker
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: mi300x-worker2
+spec:
+  nodeLabels:
+    kubernetes.io/hostname: kind-wva-gpu-cluster-worker2

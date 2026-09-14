@@ -1,0 +1,50 @@
+# KEDA ScaledObject for Deployment app-b. See scaledobject-app-a.yaml for the full
+# derivation of the query and every constant used below (design.md §6) — this file is
+# the identical pattern applied to app-b's own metric series and scaleTargetRef.
+#
+#   replicas = ceil(demand / podCapacityRPS) + warmReplicas
+#            = ceil(demand / 10) + 2
+#
+# `or vector(0)` is required: see scaledobject-app-a.yaml for why.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: app-b
+  namespace: gpu-lease-poc
+  labels:
+    app: app-b
+    app.kubernetes.io/part-of: gpu-lease-poc
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: app-b
+  minReplicaCount: 4
+  maxReplicaCount: 10
+  pollingInterval: 10
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+          - type: Pods
+            value: 2
+            periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Pods
+            value: 2
+            periodSeconds: 15
+  triggers:
+  - type: prometheus
+    name: demand-plus-overprovision
+    metricType: AverageValue
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+      query: |
+        (max by (deployment) (gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-b"}) or vector(0))
+        + (2 * 10)
+      threshold: "10"
+      activationThreshold: "0"

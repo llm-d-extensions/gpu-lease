@@ -1,0 +1,82 @@
+# Deployment app-b: the second demo workload (design.md §2, §4.3, §5). Identical
+# shape to app-a.yaml (see its comments for the full rationale, in particular why there
+# is deliberately no nodeSelector) with every app-a-specific value swapped to app-b.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-b
+  namespace: gpu-lease-poc
+  labels:
+    app: app-b
+    app.kubernetes.io/part-of: gpu-lease-poc
+  annotations:
+    gpu-lease.llm-d.ai/managed: "true"
+    gpu-lease.llm-d.ai/warm-replicas: "2"
+    gpu-lease.llm-d.ai/min-hot-replicas: "1"
+    gpu-lease.llm-d.ai/local-queue: app-b-gpu
+    gpu-lease.llm-d.ai/pod-capacity-rps: "10"
+    gpu-lease.llm-d.ai/activation-timeout: 120s
+    gpu-lease.llm-d.ai/admission-timeout: 60s
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: app-b
+  template:
+    metadata:
+      labels:
+        app: app-b
+        deployment: app-b
+        gpu-lease.llm-d.ai/state: warm
+    spec:
+      serviceAccountName: gpu-lease-workload
+      containers:
+        - name: workload
+          image: gpu-lease-workload:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: DEPLOYMENT_NAME
+              value: app-b
+            - name: POD_CAPACITY_RPS
+              value: "10"
+            - name: WARMUP_SECONDS
+              value: "10"
+            - name: TEARDOWN_SECONDS
+              value: "2"
+            - name: DEMAND_CONFIGMAP
+              value: gpu-lease-demand
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 5

@@ -1,0 +1,121 @@
+# Deployment app-a: one of the two demo workloads (design.md §2, §4.3, §5).
+#
+# The gpu-lease.llm-d.ai/* annotations opt this Deployment into WarmPool management
+# (api/v1alpha1.IsManaged / ParseDeploymentSettings) -- values below are this repo's
+# documented defaults (api/v1alpha1.Default*), spelled out explicitly for demo
+# legibility rather than left to fall back silently.
+#
+# Deliberately NO nodeSelector. Pods must be free to land on all three nodes:
+#
+#   1. poc.llm-d.ai/gpu-count is the single source of truth for leasable inventory
+#      (design.md §4.5, internal/controller/inventory). It is "4" on all three nodes,
+#      and deploy/kueue/cluster-queue.yaml grants nominalQuota 4 to all three flavors
+#      including mi300x-worker2. Pinning pods with a vendor label (nvidia.com/gpu.count,
+#      which is absent on worker2) would strand worker2's 4 GPUs of quota permanently
+#      and introduce a second, conflicting source of truth for node capacity.
+#   2. The vendor labels (nvidia.com/*, amd.com/*) belong to an unrelated PoC on this
+#      cluster. Nothing in this repo reads them; depending on them would couple our
+#      demo to state we do not own.
+#   3. The demo needs warm pods on nodes with no free GPU -- that is precisely how
+#      NoFreeGPUOnAnyPodNode is exercised (design.md §2 step 7, hack/demo.sh). Excluding
+#      a node from scheduling makes that failure mode unreachable by natural means.
+#
+# All three nodes are untainted, so the control-plane node is schedulable too.
+# Heterogeneous gpu-model values (H100 / A100 / MI300X) are intentional: they show up in
+# the pod's gpu-lease.llm-d.ai/gpu-model annotation once a lease is bound.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-a
+  namespace: gpu-lease-poc
+  labels:
+    app: app-a
+    app.kubernetes.io/part-of: gpu-lease-poc
+  annotations:
+    gpu-lease.llm-d.ai/managed: "true"
+    gpu-lease.llm-d.ai/warm-replicas: "2"
+    gpu-lease.llm-d.ai/min-hot-replicas: "1"
+    gpu-lease.llm-d.ai/local-queue: app-a-gpu
+    gpu-lease.llm-d.ai/pod-capacity-rps: "10"
+    gpu-lease.llm-d.ai/activation-timeout: 120s
+    gpu-lease.llm-d.ai/admission-timeout: 60s
+spec:
+  # 2 hot + 2 warm at demand=20/capacity=10 (design.md §2 step 1); KEDA's
+  # minReplicaCount (deploy/keda/scaledobject-app-a.yaml) matches this floor.
+  replicas: 4
+  selector:
+    matchLabels:
+      app: app-a
+  template:
+    metadata:
+      labels:
+        app: app-a
+        # deployment: <name> is a *variable* Prometheus label baked into every metric
+        # this pod emits (internal/workload.NewMetrics's ConstLabels) -- it is not a
+        # ServiceMonitor-derived label (endpoints-role relabeling never adds
+        # "deployment"), so it must come from here via the DEPLOYMENT_NAME env var
+        # below, and be consistent with it.
+        deployment: app-a
+        # Every new replica is born warm (design.md §4.4); the WarmPool reconciler
+        # (sibling phase) promotes it from here.
+        gpu-lease.llm-d.ai/state: warm
+    spec:
+      serviceAccountName: gpu-lease-workload
+      containers:
+        - name: workload
+          image: gpu-lease-workload:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            # Downward API: required by internal/workload (fail-fast in
+            # cmd/workload/main.go if either NODE_NAME or POD_NAMESPACE is empty).
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # No downward-API field exists for a pod's owning Deployment name; it must
+            # be literal, and must match both the label above and the
+            # gpu-lease-demand ConfigMap key this Deployment is meant to watch.
+            - name: DEPLOYMENT_NAME
+              value: app-a
+            - name: POD_CAPACITY_RPS
+              value: "10"
+            - name: WARMUP_SECONDS
+              value: "10"
+            - name: TEARDOWN_SECONDS
+              value: "2"
+            - name: DEMAND_CONFIGMAP
+              value: gpu-lease-demand
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          # design.md §5: /healthz and /readyz always return 200 regardless of
+          # warm/hot -- readiness must not depend on hotness or KEDA's replica math
+          # (which counts *ready* pods) breaks.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 5

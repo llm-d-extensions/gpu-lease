@@ -1,0 +1,8 @@
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Workload
+metadata:
+  name: spike-wl-invalid
+  namespace: gpu-lease-poc
+spec:
+  queueName: app-a-gpu
+  podSets: []

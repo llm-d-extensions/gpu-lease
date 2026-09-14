@@ -1,0 +1,34 @@
+# app-b's Services -- mirror of service-app-a.yaml (see its comments for rationale).
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-b
+  namespace: gpu-lease-poc
+  labels:
+    app: app-b
+    gpu-lease.llm-d.ai/service-role: hot
+spec:
+  selector:
+    app: app-b
+    gpu-lease.llm-d.ai/state: hot
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-b-all
+  namespace: gpu-lease-poc
+  labels:
+    app: app-b
+    gpu-lease.llm-d.ai/service-role: all
+spec:
+  clusterIP: None
+  selector:
+    app: app-b
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

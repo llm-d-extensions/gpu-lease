@@ -1,0 +1,43 @@
+# ServiceMonitor for app-a (design.md §5, §6). Targets the headless app-a-all Service
+# (service-app-a.yaml) so every pod -- warm or hot -- is scraped, at interval: 10s so
+# the KEDA reaction time in design.md §6 (~20-30s end to end) holds.
+#
+# kube-prometheus-stack in this cluster has serviceMonitorSelector: {} /
+# serviceMonitorNamespaceSelector: {} (design.md §3): it scrapes ServiceMonitors in
+# every namespace with no required labels, so no extra release/team label is needed
+# here for discovery.
+#
+# honorLabels: true matters here: the "endpoints" role's default relabeling adds its
+# own pod/namespace/service/container/endpoint labels from service discovery, which
+# would otherwise collide with (and silently rename to exported_pod, etc.) this app's
+# own "pod" ConstLabel on gpulease_pod_hot/_pod_capacity_rps/_pod_gpu_id/_requests_total
+# (internal/workload/metrics.go). Since both values are identical for a given target,
+# honorLabels: true (scraped label wins) keeps the metric's own "pod" label intact and
+# named "pod", not "exported_pod".
+#
+# Note: gpulease_demand_rps deliberately carries *only* a "deployment" ConstLabel
+# (internal/workload/metrics.go) -- it is not per-pod. The "deployment" label on every
+# metric this app emits comes from that ConstLabel, not from any relabeling here: the
+# endpoints role never adds a "deployment" label on its own (design.md §6's PromQL
+# relies on this).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: app-a
+  namespace: gpu-lease-poc
+  labels:
+    app: app-a
+    app.kubernetes.io/part-of: gpu-lease-poc
+spec:
+  selector:
+    matchLabels:
+      app: app-a
+      gpu-lease.llm-d.ai/service-role: all
+  namespaceSelector:
+    matchNames:
+      - gpu-lease-poc
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 10s
+      honorLabels: true

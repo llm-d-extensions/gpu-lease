@@ -1,0 +1,45 @@
+# Two Services per app (design.md §4.4 "Traffic"):
+#
+#  - app-a: ClusterIP, selects only hot pods. Warm pods receive no traffic.
+#  - app-a-all: headless (clusterIP: None), selects every app-a pod regardless of
+#    state, purely so Prometheus can discover and scrape all of them (warm pods must
+#    still be scraped: gpulease_pod_hot=0 on a warm pod is itself a data point, and
+#    every pod republishes the same deployment-wide gpulease_demand_rps).
+#
+# app-a-all carries the extra gpu-lease.llm-d.ai/service-role: all label specifically
+# so servicemonitor-app-a.yaml's selector can target it unambiguously (ServiceMonitor
+# selectors match a Service's own labels, not its pod selector -- matching on `app:
+# app-a` alone would also match the hot-only Service below).
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-a
+  namespace: gpu-lease-poc
+  labels:
+    app: app-a
+    gpu-lease.llm-d.ai/service-role: hot
+spec:
+  selector:
+    app: app-a
+    gpu-lease.llm-d.ai/state: hot
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-a-all
+  namespace: gpu-lease-poc
+  labels:
+    app: app-a
+    gpu-lease.llm-d.ai/service-role: all
+spec:
+  clusterIP: None
+  selector:
+    app: app-a
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
