@@ -183,9 +183,9 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	target := targetHot(readyCount, settings.WarmReplicas, settings.MinHotReplicas)
 
-	PoolHotPods.WithLabelValues(dep.Name).Set(float64(hotCount))
-	PoolWarmPods.WithLabelValues(dep.Name).Set(float64(readyCount - hotCount))
-	PoolWarmDesired.WithLabelValues(dep.Name).Set(float64(settings.WarmReplicas))
+	PoolHotPods.WithLabelValues(dep.Namespace, dep.Name).Set(float64(hotCount))
+	PoolWarmPods.WithLabelValues(dep.Namespace, dep.Name).Set(float64(readyCount - hotCount))
+	PoolWarmDesired.WithLabelValues(dep.Namespace, dep.Name).Set(float64(settings.WarmReplicas))
 
 	if int32(readyCount) < settings.MinHotReplicas+settings.WarmReplicas {
 		// design.md §4.6/task instructions: hot capacity wins when there are not enough

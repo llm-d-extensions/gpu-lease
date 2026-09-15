@@ -1,19 +1,26 @@
 # KEDA ScaledObject for Deployment app-b. See scaledobject-app-a.yaml for the full
-# derivation of the query and every constant used below (design.md §6) — this file is
-# the identical pattern applied to app-b's own metric series and scaleTargetRef.
+# derivation of the formula and every constant used below (design.md §6) — this file is the
+# identical pattern applied to app-b's own metric series and scaleTargetRef.
 #
 #   replicas = ceil(demand / podCapacityRPS) + warmReplicas
 #            = ceil(demand / 10) + 2
 #
-# `or vector(0)` is required: see scaledobject-app-a.yaml for why. The aggregation is
-# `max(...)` with NO `by (deployment)` clause for the same reason documented there:
-# this query's metric selector already pins deployment="app-b", so `max(...)`
-# collapses to a single empty-label-set `{}` series that correctly matches (and gets
-# deduplicated against) `vector(0)`'s own `{}` series under `or`'s default "match on
-# all labels" semantics. `max by (deployment) (...)` would instead produce
-# `{deployment="app-b"}`, which never matches `{}`, so `or vector(0)` would never
-# suppress once real data exists and the query would return two elements -- exactly
-# the "returned multiple elements" failure KEDA's Prometheus scaler rejects.
+# The warm term is the warm_desired trigger (the controller's gpulease_pool_warm_desired
+# gauge, publishing the Deployment's gpu-lease.llm-d.ai/warm-replicas annotation), not a
+# constant in PromQL; capacity is the 10.0 divisor in the formula and nowhere else.
+#
+# Trigger names must be underscore-separated: they become identifiers in the formula, which
+# is compiled with expr-lang/expr, where a dash is subtraction.
+#
+# `or vector(N)` is required on both queries, and both aggregations are `max(...)` with NO
+# `by (...)` clause: see scaledobject-app-a.yaml for why (each query is already pinned to
+# one deployment, so `max(...)` collapses to a single `{}`-labeled series that `or` can
+# match against `vector(N)`'s own `{}` series; `max by (deployment) (...)` would make the
+# query return two elements, which KEDA's Prometheus scaler rejects).
+#
+# The warm_desired query selects on workload_namespace, not namespace: that gauge comes
+# from the controller-manager's own metrics Service, so Prometheus attaches the
+# controller's namespace to it (internal/controller/metrics.go).
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -41,18 +48,30 @@ spec:
             periodSeconds: 15
         scaleDown:
           stabilizationWindowSeconds: 30
+          # Pods, not Percent, and value <= warm-replicas: one step must never remove more
+          # than the warm buffer, or scale-down reaches GPU-holding pods.
           policies:
           - type: Pods
             value: 2
             periodSeconds: 15
+    scalingModifiers:
+      formula: "demand_rps / 10.0 + warm_desired"
+      target: "1"
+      activationTarget: "0"
+      metricType: AverageValue
   triggers:
   - type: prometheus
-    name: demand-plus-overprovision
-    metricType: AverageValue
+    name: demand_rps
     metadata:
       serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
       query: |
-        (max(gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-b"}) or vector(0))
-        + (2 * 10)
-      threshold: "10"
-      activationThreshold: "0"
+        max(gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-b"}) or vector(0)
+      # Inert under scalingModifiers; real capacity is the divisor in the formula.
+      threshold: "1"
+  - type: prometheus
+    name: warm_desired
+    metadata:
+      serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+      query: |
+        max(gpulease_pool_warm_desired{workload_namespace="gpu-lease-poc",deployment="app-b"}) or vector(2)
+      threshold: "1"

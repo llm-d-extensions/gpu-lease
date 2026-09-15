@@ -230,19 +230,27 @@ max by (deployment) (gpulease_demand_rps{namespace="gpu-lease-poc"})
 # current served capacity: 10 rps * number of hot pods, per deployment
 sum by (deployment) (gpulease_pod_capacity_rps{namespace="gpu-lease-poc"})
 
-# the exact value KEDA's trigger is scaling on (demand + fixed overprovision term)
-# NOTE: no `by (deployment)` here, unlike the queries above -- this one is already
-# scoped to a single deployment via the label matcher, and pairing `by (deployment)`
-# with `or vector(0)` on an already-scoped query returns 2 elements once real data
-# exists (KEDA rejects that as "returned multiple elements") -- see design.md §6.
-(max(gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0)) + (2 * 10)
+# the replica count KEDA's scalingModifiers formula composes, per trigger and combined
+# (design.md §6). NOTE: no `by (deployment)` on either trigger query, unlike the queries
+# above -- each is already scoped to a single deployment via the label matcher, and
+# pairing `by (deployment)` with `or vector(...)` on an already-scoped query returns 2
+# elements once real data exists (KEDA rejects that as "returned multiple elements").
+max(gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0)
+max(gpulease_pool_warm_desired{workload_namespace="gpu-lease-poc",deployment="app-a"}) or vector(2)
+# = the composite metric the HPA sees, i.e. hotPodsNeeded + warmDesired:
+  (max(gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0)) / 10
++ (max(gpulease_pool_warm_desired{workload_namespace="gpu-lease-poc",deployment="app-a"}) or vector(2))
 
-# hot vs warm pod counts over time (controller-exposed, design.md §7)
-gpulease_pool_hot_pods{namespace="gpu-lease-poc"}
-gpulease_pool_warm_pods{namespace="gpu-lease-poc"}
+# hot vs warm pod counts over time (controller-exposed, design.md §7).
+# These come from the controller-manager's metrics Service, so the `namespace` label
+# Prometheus attaches is the *controller's* namespace; the workload's namespace is the
+# controller-exposed `workload_namespace` label.
+gpulease_pool_hot_pods{workload_namespace="gpu-lease-poc"}
+gpulease_pool_warm_pods{workload_namespace="gpu-lease-poc"}
 
-# lease acquisition failures by reason (steps 6/7)
-sum by (deployment, reason) (gpulease_lease_acquire_failures_total{namespace="gpu-lease-poc"})
+# lease acquisition failures by reason (steps 6/7). Also a controller-side metric: it has
+# no workload-namespace label at all, so do not filter it on `namespace`.
+sum by (deployment, reason) (gpulease_lease_acquire_failures_total)
 ```
 
 ## Tearing down

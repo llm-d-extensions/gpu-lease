@@ -25,14 +25,29 @@ import (
 // reconcilers report through these; they are registered with controller-runtime's
 // global metrics registry (the same registry the manager's /metrics endpoint serves) by
 // the init() below, so importing this package is enough to make them show up.
+//
+// The per-Deployment gauges are labeled ("workload_namespace", "deployment"), not just
+// ("deployment"): a Deployment is only unique within its namespace, and the `namespace`
+// label Prometheus attaches to these series is the *controller's* namespace (it comes
+// from the scrape target, which is the controller-manager metrics Service), so it cannot
+// be used to disambiguate two managed Deployments of the same name in different
+// namespaces. The label deliberately is not called `namespace`: an exposed label that
+// collides with a target label gets renamed to `exported_namespace` by Prometheus
+// (honor_labels: false, the default), which is exactly the kind of surprise a KEDA
+// trigger query should not have to know about. See deploy/keda/scaledobject-app-a.yaml,
+// which selects gpulease_pool_warm_desired on (workload_namespace, deployment).
 var (
+	// poolLabels is the label set of every per-Deployment pool gauge below; keep the
+	// WithLabelValues call order (namespace, name) in sync with it.
+	poolLabels = []string{"workload_namespace", "deployment"}
+
 	// PoolHotPods is the observed number of hot pods per managed Deployment.
 	PoolHotPods = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "gpulease_pool_hot_pods",
 			Help: "Number of pods currently in state hot, per managed Deployment.",
 		},
-		[]string{"deployment"},
+		poolLabels,
 	)
 
 	// PoolWarmPods is the observed number of warm (+ activating/releasing) pods per
@@ -42,16 +57,21 @@ var (
 			Name: "gpulease_pool_warm_pods",
 			Help: "Number of pods currently in state warm, per managed Deployment.",
 		},
-		[]string{"deployment"},
+		poolLabels,
 	)
 
-	// PoolWarmDesired is the configured warm-replicas target per managed Deployment.
+	// PoolWarmDesired is the configured warm-replicas target per managed Deployment. It
+	// is what makes the Deployment's gpu-lease.llm-d.ai/warm-replicas annotation the
+	// single source of truth for the warm buffer: the KEDA ScaledObject reads this gauge
+	// as its `warm_desired` trigger and adds it, as a replica count, in the
+	// advanced.scalingModifiers formula (design.md §6) rather than hardcoding the number
+	// into PromQL.
 	PoolWarmDesired = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "gpulease_pool_warm_desired",
 			Help: "Configured gpu-lease.llm-d.ai/warm-replicas target, per managed Deployment.",
 		},
-		[]string{"deployment"},
+		poolLabels,
 	)
 
 	// LeasesActive is the number of Bound (or in-flight) GPULeases per node.

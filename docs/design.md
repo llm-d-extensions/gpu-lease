@@ -359,26 +359,84 @@ not the default).
 
 ## 6. KEDA wiring
 
-One `ScaledObject` per deployment. The trigger deliberately knows nothing about warm/hot — it
-divides *(demand + overprovision)* by *per-hot-pod capacity*:
+One `ScaledObject` per deployment. The triggers deliberately know nothing about warm/hot — a KEDA
+[`advanced.scalingModifiers`](https://keda.sh/docs/2.20/reference/scaledobject-spec/#advancedscalingmodifiers)
+formula divides each demand signal by *per-hot-pod capacity* and adds the warm buffer as one more
+term, so every term of the formula is already a replica count:
 
 ```yaml
 minReplicaCount: 4          # 2 hot + 2 warm floor
 maxReplicaCount: 10
 pollingInterval: 10
+advanced:
+  scalingModifiers:
+    formula: "demand_rps / 10.0 + warm_desired"   # 10.0 = pod-capacity-rps
+    target: "1"                                   # => ceil(formula / 1)
+    activationTarget: "0"
+    metricType: AverageValue
 triggers:
 - type: prometheus
-  metricType: AverageValue      # desiredReplicas = ceil(metricValue / threshold)
+  name: demand_rps            # underscores: names are formula identifiers (see below)
   metadata:
     serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
     query: |
-      (max(gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0))
-      + (2 * 10)
-    threshold: "10"             # = pod-capacity-rps
-    activationThreshold: "0"
+      max(gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0)
+    threshold: "1"            # inert under scalingModifiers; capacity is the divisor above
+- type: prometheus
+  name: warm_desired          # the warm-replicas annotation, not a constant
+  metadata:
+    serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+    query: |
+      max(gpulease_pool_warm_desired{workload_namespace="gpu-lease-poc",deployment="app-a"}) or vector(2)
+    threshold: "1"
 ```
 
-Note the aggregation is `max(...)` with **no** `by (deployment)` clause, even though the metric
+`target: "1"` with `metricType: AverageValue` makes the HPA compute `ceil(formulaValue / 1)`, and
+`warmDesired` is an integer, so `ceil(x + n) == ceil(x) + n` gives exactly
+
+```
+replicas = ceil(demand / C) + warmReplicas = hotPodsNeeded + warmReplicas
+```
+
+demand=20, C=10 → **4** (2 hot + 2 warm). demand=25 → **5** (3 hot + 2 warm). Exactly the scenario.
+
+**Why the formula rather than folding the warm term into PromQL.** The mechanical alternative —
+`(demand or vector(0)) + (warmReplicas * C)` with `threshold: C`, which is what this PoC ran
+first — works, but it duplicates two constants into every query. The warm count is a *replica
+count* that has to be written pre-multiplied by capacity to survive the HPA's later division, so
+the multiplier and `threshold` must be kept equal by hand, and the Deployment's
+`gpu-lease.llm-d.ai/warm-replicas` annotation stops being the single source of truth. Under
+`scalingModifiers` the division happens inside the formula, so the warm buffer is added in its own
+units as its own trigger, reading the controller's `gpulease_pool_warm_desired` gauge (§7) — change
+the annotation and no manifest changes. Capacity then lives in exactly one place, the divisor. With
+more than one demand signal the formula's explicit `max()` also replaces the HPA's implicit
+max-across-metrics, so a per-trigger warm term cannot be silently forgotten on whichever trigger
+happens to dominate (`ceil` is monotonic, so `max(ceil(a), ceil(b)) == ceil(max(a, b))` — the
+refactor is exact, not approximate). The `- activating` correction for promotion overshoot is
+likewise expressible only in a formula, since HPA `behavior` is per-direction, not per-metric; see
+`docs/proposals/keda-epp-queue-warm-pods.md`, which proposes this same shape upstream.
+
+**KEDA specifics** (verified against v2.20.2, the version this PoC runs; `scalingModifiers` needs
+≥ 2.12): trigger names become identifiers in a formula compiled with
+[expr](https://github.com/expr-lang/expr), where `-` is subtraction — a trigger named
+`demand-plus-overprovision` parses as `demand - plus - overprovision` and the ScaledObject is
+rejected, hence the underscore names. Per-trigger `threshold` is still required by the Prometheus
+scaler's metadata validation but is inert (KEDA replaces all external metric specs with a single
+`composite-metric` and hands the formula raw values), so both are pinned to `"1"`; per-trigger
+`metricType`/`activationThreshold` are superseded by `scalingModifiers.metricType`/`.activationTarget`
+and dropped. `kubectl describe hpa` shows one `composite-metric` row instead of one row per named
+trigger — individual trigger values remain on the KEDA operator's own metrics endpoint. A trigger
+that errors fails the whole composite metric, so `or vector(...)` matters more, not less, than
+before.
+
+The `warm_desired` query selects on `workload_namespace`, **not** `namespace`: that gauge is scraped
+from the controller-manager's metrics Service, so the `namespace` label Prometheus attaches is the
+*controller's* namespace. `workload_namespace` is the label the controller exposes for the managed
+Deployment's own namespace (`internal/controller/metrics.go`); it deliberately isn't called
+`namespace`, since an exposed label colliding with a target label is renamed to
+`exported_namespace` by Prometheus's default `honor_labels: false`.
+
+Note both aggregations are `max(...)` with **no** `by (deployment)` clause, even though the metric
 selector already pins `deployment="app-a"`. This is deliberate, not a simplification: PromQL's `or`
 only drops `vector(0)`'s result when its label set exactly equals a left-hand series's label set
 (default vector matching = all labels). `vector(0)` always yields one series with an **empty**
@@ -386,8 +444,8 @@ label set `{}`. `max(...)` with no `by` also collapses to `{}` (since the query 
 to one deployment, no grouping is needed to get down to a single series), so once real data
 exists the two `{}` series match and `or` correctly drops `vector(0)`. `max by (deployment) (...)`
 instead yields `{deployment="app-a"}`, which is never equal to `{}` — so `or vector(0)` never
-suppresses, and once the metric has data **both** series survive into `+ (2 * 10)` (broadcast over
-every element), producing two results. KEDA's Prometheus scaler rejects any query returning more
+suppresses, and once the metric has data **both** series survive (the real one and `vector(0)`'s
+zero), producing two results. KEDA's Prometheus scaler rejects any query returning more
 than one element (`"...returned multiple elements"`), which surfaces as the ScaledObject's
 `TriggerError`/`FailedGetExternalMetric` conditions and `kubectl get hpa` showing `<unknown>` —
 this is exactly the failure this PoC hit when the query was first written with `by (deployment)`
@@ -396,14 +454,6 @@ reasoning restated there. The `max by (deployment)` form is still correct — an
 *unscoped, cross-deployment* reference queries in `docs/demo.md` (e.g. Grafana panels querying all
 deployments at once), since those need the grouping to keep app-a/app-b as separate series; it is
 only wrong here because this query is already filtered down to a single deployment.
-
-With `metricType: AverageValue` the HPA computes `ceil(metricValue / threshold)`, so
-
-```
-replicas = ceil((demand + warmReplicas × C) / C) = ceil(demand / C) + warmReplicas
-```
-
-demand=20, C=10 → **4** (2 hot + 2 warm). demand=25 → **5** (3 hot + 2 warm). Exactly the scenario.
 
 HPA behavior tuned for a live demo: `scaleUp.stabilizationWindowSeconds: 0`,
 `scaleDown.stabilizationWindowSeconds: 30`, 2 pods / 15s both directions.
@@ -438,7 +488,9 @@ Images built locally and `kind load`-ed (no registry): `gpu-lease-controller:dev
 Controller: single replica, leader election on, `--warm-pool-resync=15s`,
 exposes its own metrics + a ServiceMonitor:
 
-- `gpulease_pool_hot_pods{deployment}` / `_warm_pods` / `_warm_desired`
+- `gpulease_pool_hot_pods{workload_namespace,deployment}` / `_warm_pods` / `_warm_desired`
+  (`workload_namespace` is the *managed Deployment's* namespace; the `namespace` label Prometheus
+  attaches to these series is the controller's own — see §6)
 - `gpulease_leases_active{node}` / `gpulease_node_gpus_free{node}`
 - `gpulease_lease_acquire_failures_total{deployment,reason}`
 - `gpulease_promotions_total` / `gpulease_demotions_total`
