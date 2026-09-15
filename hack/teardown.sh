@@ -25,6 +25,15 @@
 #     hack/setup-nodes.sh resets them before the next demo)
 #   - deploy/kueue/local-queues.yaml's LocalQueues are namespaced (gpu-lease-poc) and
 #     are removed as part of the namespace delete above, not listed separately
+#   - the GPULease controller itself: its CRD, Deployment, Service, ServiceMonitor,
+#     and RBAC, all in namespace gpu-lease-scaffold-system (created by `make install` +
+#     `make deploy`, config/), and the ClusterRoleBinding at
+#     deploy/monitoring/prometheus-metrics-reader-binding.yaml that lets Prometheus
+#     scrape it. Deliberately left running so re-running the install order (docs/
+#     demo.md) re-applies unchanged manifests as a no-op and the demo comes back
+#     without a CRD-recreation race. To remove these too (a genuinely clean slate,
+#     not just a demo reset): `make undeploy && make uninstall` and
+#     `kubectl delete -f deploy/monitoring/`.
 #
 # Requires --yes (no destructive action runs without it -- even --dry-run=client/server
 # validation of this file does not require it, since no kubectl calls happen at parse

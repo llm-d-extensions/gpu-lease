@@ -17,8 +17,11 @@
 #   --yes        skip the interactive "press Enter to continue" pause before each step
 #                (default: pause, printing what is about to happen and what to expect).
 #
-# Dependencies: kubectl, jq, curl (curl only for the best-effort Prometheus checks in
-# steps 1/6, which are informational and never fail the step).
+# Dependencies: kubectl, jq, curl (curl only for the Prometheus
+# gpulease_lease_acquire_failures_total checks in steps 6/7, design.md §9 criterion 4;
+# see the comment above prom_query() for why they assert a real requirement now rather
+# than being purely informational, and why a single timeout there still doesn't abort
+# the rest of the run).
 #
 # Assumptions about interfaces owned by other phases (see docs/demo.md and the final
 # report of the agent that wrote this file for the full list):
@@ -210,8 +213,23 @@ check_no_crashloop() { # app
   [[ -z "$bad" ]]
 }
 
-# Best-effort, informational-only Prometheus query via a short-lived port-forward.
-# Never fails a step on its own -- callers should treat its result as advisory.
+# Prometheus query via a short-lived port-forward.
+#
+# This asserts a real requirement (design.md §9 criterion 4: step 6 must yield "a
+# non-zero gpulease_lease_acquire_failures_total"), not an advisory one -- see the
+# controller-manager's ServiceMonitor (config/prometheus/monitor.yaml, enabled via
+# config/default/kustomization.yaml's `- ../prometheus`) and its matching RBAC grant
+# (deploy/monitoring/prometheus-metrics-reader-binding.yaml) for why this now reliably
+# has data: earlier in this PoC's history the controller's own /metrics endpoint had
+# no Prometheus scrape target at all (that gap is what's fixed by those two files), so
+# this query always returned empty and callers below downgraded it to "best-effort".
+# It is a real, working query now; callers still don't abort the whole run on a single
+# timeout here (see the `|| info ...` on each call site) so a transient port-forward
+# hiccup in a live demo doesn't cost you the remaining steps -- but a failure here is a
+# genuine regression, not an environment quirk, and should be investigated as one:
+# check `kubectl get servicemonitor -n gpu-lease-scaffold-system` and the Prometheus
+# target's health (`/targets` in the Prometheus UI, or the API queried the same way
+# this function does) before assuming otherwise.
 prom_query() { # promql
   local q="$1" port=39090 pid out
   kubectl -n monitoring port-forward svc/prometheus-kube-prometheus-prometheus "${port}:9090" \
@@ -224,9 +242,9 @@ prom_query() { # promql
   wait "$pid" 2>/dev/null || true
   echo "$out"
 }
-check_failure_metric_nonzero() { # app
+check_failure_metric_nonzero() { # app reason
   local val
-  val="$(prom_query "sum(gpulease_lease_acquire_failures_total{deployment=\"$1\"})" \
+  val="$(prom_query "sum(gpulease_lease_acquire_failures_total{deployment=\"$1\",reason=\"$2\"})" \
     | jq -r '.data.result[0].value[1] // "0"' 2>/dev/null || echo 0)"
   awk -v v="${val:-0}" 'BEGIN{exit !(v+0>0)}'
 }
@@ -395,8 +413,9 @@ step6() {
 
   wait_for "app-a: a GPULease fails with QuotaExhaustedOnNode within 180s" 180 check_quota_exhausted
   wait_for "app-a: no pod is crash-looping"                                 15 check_no_crashloop "$APP_A"
-  wait_for "app-a: gpulease_lease_acquire_failures_total > 0 (best-effort)" 60 check_failure_metric_nonzero "$APP_A" \
-    || info "metric check is informational only (Prometheus scrape lag or port-forward denied); not a step failure"
+  wait_for "app-a: gpulease_lease_acquire_failures_total{reason=QuotaExhaustedOnNode} > 0 (design.md §9 criterion 4)" \
+    60 check_failure_metric_nonzero "$APP_A" "QuotaExhaustedOnNode" \
+    || info "did not abort the run for this alone -- see the comment above prom_query() if it keeps failing"
 
   restore_pin_and_capacity
 }
@@ -439,8 +458,9 @@ step7() {
 
   wait_for "app-a: NoFreeGPUOnAnyPodNode within 180s"                       180 check_no_free_gpu
   wait_for "app-a: no pod is crash-looping"                                  15 check_no_crashloop "$APP_A"
-  wait_for "app-a: gpulease_lease_acquire_failures_total > 0 (best-effort)"  60 check_failure_metric_nonzero "$APP_A" \
-    || info "metric check is informational only; not a step failure"
+  wait_for "app-a: gpulease_lease_acquire_failures_total{reason=NoFreeGPUOnAnyPodNode} > 0" \
+    60 check_failure_metric_nonzero "$APP_A" "NoFreeGPUOnAnyPodNode" \
+    || info "did not abort the run for this alone -- see the comment above prom_query() if it keeps failing"
 
   restore_pin_and_capacity
 }

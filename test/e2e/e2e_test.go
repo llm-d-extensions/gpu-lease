@@ -17,313 +17,176 @@ limitations under the License.
 package e2e
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	. "github.com/onsi/ginkgo/v2" //nolint:golint,revive
+	. "github.com/onsi/gomega"    //nolint:golint,revive
 
-	"github.com/llm-d-extensions/gpu-lease/test/utils"
+	gpuleasev1alpha1 "github.com/llm-d-extensions/gpu-lease/api/v1alpha1"
 )
 
-// namespace where the project is deployed in
-const namespace = "gpu-lease-scaffold-system"
+// These two specs cover the minimum design.md §9 asks for end-to-end, against the
+// live cluster BeforeSuite already validated is up and at baseline:
+//   - a promotion that reaches GPULease phase Bound with its pod reporting "hot",
+//     and the full causal chain behind it (Kueue Workload Admitted, the admitted
+//     ResourceFlavor's node label matching the lease's node) -- design.md §9
+//     criterion 1/2, the same claim verified by hand for this Phase 6 report.
+//   - one of the two documented failure modes, NoFreeGPUOnAnyPodNode -- design.md
+//     §9 criterion 4. QuotaExhaustedOnNode (the other failure mode) is
+//     deliberately left to hack/demo.sh --step 6: reaching it requires inflating a
+//     node's poc.llm-d.ai/gpu-count label *above* the ClusterQueue's real
+//     nominalQuota (see the comment above step6() in hack/demo.sh), which is a
+//     property of this specific deployment's deploy/kueue/cluster-queue.yaml, not
+//     something this suite should assume or hard-code. NoFreeGPUOnAnyPodNode needs
+//     no such assumption -- zeroing a node's label is self-contained regardless of
+//     quota -- so it is the one exercised here.
+var _ = Describe("GPULease lifecycle", func() {
 
-// serviceAccountName created for the project
-const serviceAccountName = "gpu-lease-scaffold-controller-manager"
-
-// metricsServiceName is the name of the metrics service of the project
-const metricsServiceName = "gpu-lease-scaffold-controller-manager-metrics-service"
-
-// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
-const metricsRoleBindingName = "gpu-lease-scaffold-metrics-binding"
-
-var _ = Describe("Manager", Ordered, func() {
-	var controllerPodName string
-
-	// Before running the tests, set up the environment by creating the namespace,
-	// enforce the restricted security policy to the namespace, installing CRDs,
-	// and deploying the controller.
-	BeforeAll(func() {
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
-
-		By("labeling the namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
-
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
-	})
-
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
-	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
-		_, _ = utils.Run(cmd)
-
-		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
-
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
-	})
-
-	// After each test, check for failures and collect logs, events,
-	// and pod descriptions for debugging.
-	AfterEach(func() {
-		specReport := CurrentSpecReport()
-		if specReport.Failed() {
-			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			controllerLogs, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
-			}
-
-			By("Fetching Kubernetes events")
-			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
-			eventsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
-			}
-
-			By("Fetching curl-metrics logs")
-			cmd = exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-			metricsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Metrics logs:\n %s", metricsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get curl-metrics logs: %s", err)
-			}
-
-			By("Fetching controller manager pod description")
-			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
-			podDescription, err := utils.Run(cmd)
-			if err == nil {
-				fmt.Println("Pod description:\n", podDescription)
-			} else {
-				fmt.Println("Failed to describe controller pod")
-			}
-		}
-	})
-
-	SetDefaultEventuallyTimeout(2 * time.Minute)
-	SetDefaultEventuallyPollingInterval(time.Second)
-
-	Context("Manager", func() {
-		It("should run successfully", func() {
-			By("validating that the controller-manager pod is running as expected")
-			verifyControllerUp := func(g Gomega) {
-				// Get the name of the controller-manager pod
-				cmd := exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
-					"-o", "go-template={{ range .items }}"+
-						"{{ if not .metadata.deletionTimestamp }}"+
-						"{{ .metadata.name }}"+
-						"{{ \"\\n\" }}{{ end }}{{ end }}",
-					"-n", namespace,
-				)
-
-				podOutput, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
-				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
-
-				// Validate the pod's status
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
-			}
-			Eventually(verifyControllerUp).Should(Succeed())
-		})
-
-		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=gpu-lease-scaffold-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
-
-			By("validating that the metrics service is available")
-			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
-
-			By("getting the service account token")
-			token, err := serviceAccountToken()
+	Context("promotion", func() {
+		It("promotes a warm pod to a Bound lease reporting hot, admitted by Kueue on the matching ResourceFlavor", func() {
+			By("recording app-b's Bound leases before the demand bump")
+			before, err := boundLeaseNamesForApp(appB)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(token).NotTo(BeEmpty())
 
-			By("waiting for the metrics endpoint to be ready")
-			verifyMetricsEndpointReady := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "endpoints", metricsServiceName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("8443"), "Metrics endpoint is not ready")
+			origDemand, err := getDemand(appB)
+			Expect(err).NotTo(HaveOccurred())
+			if origDemand == "" {
+				origDemand = baselineDemand
 			}
-			Eventually(verifyMetricsEndpointReady).Should(Succeed())
+			DeferCleanup(func() {
+				By("restoring app-b's demand to " + origDemand)
+				Expect(setDemand(appB, origDemand)).To(Succeed())
+				// Best-effort re-convergence, not asserted: hack/demo.sh's own
+				// restore path doesn't wait for this either, and the controller's
+				// warm-pool resync (design.md §4.6) will get there on its own.
+			})
 
-			By("verifying that the controller manager is serving the metrics server")
-			verifyMetricsServerStarted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("controller-runtime.metrics\tServing metrics server"),
-					"Metrics server not yet started")
-			}
-			Eventually(verifyMetricsServerStarted).Should(Succeed())
+			By("raising app-b's demand so KEDA scales up and the controller must promote the surplus warm pod")
+			Expect(setDemand(appB, "25")).To(Succeed())
 
-			By("creating the curl-metrics pod to access the metrics endpoint")
-			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
-				"--namespace", namespace,
-				"--image=curlimages/curl:latest",
-				"--overrides",
-				fmt.Sprintf(`{
-					"spec": {
-						"containers": [{
-							"name": "curl",
-							"image": "curlimages/curl:latest",
-							"command": ["/bin/sh", "-c"],
-							"args": ["curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics"],
-							"securityContext": {
-								"allowPrivilegeEscalation": false,
-								"capabilities": {
-									"drop": ["ALL"]
-								},
-								"runAsNonRoot": true,
-								"runAsUser": 1000,
-								"seccompProfile": {
-									"type": "RuntimeDefault"
-								}
-							}
-						}],
-						"serviceAccount": "%s"
+			By("waiting for a new Bound lease to appear for app-b")
+			var newLeaseName string
+			Eventually(func() (string, error) {
+				after, err := boundLeaseNamesForApp(appB)
+				if err != nil {
+					return "", err
+				}
+				for name := range after {
+					if !before[name] {
+						newLeaseName = name
+						return name, nil
 					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
+				}
+				return "", nil
+			}, "120s", "3s").ShouldNot(BeEmpty(), "no new Bound GPULease appeared for app-b")
 
-			By("waiting for the curl-metrics pod to complete.")
-			verifyCurlUp := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
-					"-o", "jsonpath={.status.phase}",
-					"-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
+			By("fetching the new lease and asserting phase Bound / Ready=True / reason Hot-or-Bound")
+			lease, err := getGPULease(newLeaseName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(lease.Status.Phase).To(Equal(gpuleasev1alpha1.GPULeasePhaseBound))
+			var readyCond *struct{ status, reason string }
+			for _, c := range lease.Status.Conditions {
+				if c.Type == gpuleasev1alpha1.ConditionReady {
+					readyCond = &struct{ status, reason string }{string(c.Status), c.Reason}
+				}
 			}
-			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
+			Expect(readyCond).NotTo(BeNil(), "lease has no Ready condition")
+			Expect(readyCond.status).To(Equal("True"))
 
-			By("getting the metrics by checking curl-metrics logs")
-			metricsOutput := getMetricsOutput()
-			Expect(metricsOutput).To(ContainSubstring(
-				"controller_runtime_reconcile_total",
-			))
+			By("asserting the claimed pod is labeled hot and actually runs on the lease's node")
+			podName := lease.Spec.ClaimRef.Name
+			// bindLease (internal/controller/gpulease_controller.go) patches the pod's
+			// state label to hot strictly before it writes the lease's Bound/Ready
+			// status in the same reconcile call, and the controller's own logs confirm
+			// that write lands before (not after) the lease's Bound status is visible --
+			// there's no real propagation delay to wait out here. An earlier version of
+			// this assertion used a bare Expect, then a 30s/90s Eventually, and still saw
+			// the label read back empty well past both windows; that turned out to be a
+			// bug in podState() itself (see its comment in helpers_test.go), which used a
+			// `-o jsonpath={.metadata.labels['...']}` bracket-key read that is unreliable
+			// for this key -- fixed now to decode `-o json` instead. The short Eventually
+			// below is kept only as ordinary defensive polling against the informer-cache
+			// staleness that's normal for *any* live-cluster read, not because this
+			// specific transition is known to be slow.
+			Eventually(func() (string, error) { return podState(podName) }, "15s", "1s").
+				Should(Equal("hot"), "pod %s should be labeled hot", podName)
+			nodeName, err := podNodeName(podName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(nodeName).To(Equal(lease.Spec.NodeName),
+				"GPULease.spec.nodeName must match the claimed pod's actual node (design.md §9 criterion 2)")
+
+			By("fetching the backing Kueue Workload and asserting QuotaReserved/Admitted are True")
+			Expect(lease.Status.WorkloadName).NotTo(BeEmpty())
+			wl, err := getWorkload(lease.Status.WorkloadName)
+			Expect(err).NotTo(HaveOccurred())
+			qr := workloadCondition(wl, "QuotaReserved")
+			Expect(qr).NotTo(BeNil())
+			Expect(string(qr.Status)).To(Equal("True"))
+			adm := workloadCondition(wl, "Admitted")
+			Expect(adm).NotTo(BeNil())
+			Expect(string(adm.Status)).To(Equal("True"))
+			Expect(wl.Status.Admission).NotTo(BeNil(), "admitted Workload must carry a podSetAssignments admission")
+
+			By("asserting the admitted ResourceFlavor's nodeLabels match the lease's actual node")
+			Expect(wl.Status.Admission.PodSetAssignments).NotTo(BeEmpty())
+			var flavorName string
+			for _, f := range wl.Status.Admission.PodSetAssignments[0].Flavors {
+				flavorName = f
+			}
+			Expect(flavorName).NotTo(BeEmpty(), "podSetAssignments should name exactly one ResourceFlavor")
+			rf, err := getResourceFlavor(flavorName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(rf.Spec.NodeLabels["kubernetes.io/hostname"]).To(Equal(lease.Spec.NodeName),
+				"the admitted ResourceFlavor %q must be keyed to the same node the lease is bound to", flavorName)
+
+			_, _ = fmt.Fprintf(GinkgoWriter,
+				"promotion causal chain verified: pod=%s node=%s lease=%s workload=%s flavor=%s\n",
+				podName, nodeName, newLeaseName, lease.Status.WorkloadName, flavorName)
 		})
+	})
 
-		// +kubebuilder:scaffold:e2e-webhooks-checks
+	Context("failure mode: NoFreeGPUOnAnyPodNode", func() {
+		It("declines to create a Workload when no warm pod sits on a node with a free GPU", func() {
+			const node = "kind-wva-gpu-cluster-worker2"
+			const admissionTimeoutKey = "gpu-lease.llm-d.ai/admission-timeout"
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput := getMetricsOutput()
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+			origSelector, err := getNodeSelectorJSON(appA)
+			Expect(err).NotTo(HaveOccurred())
+			origTimeout, err := getAnnotation(appA, admissionTimeoutKey)
+			Expect(err).NotTo(HaveOccurred())
+			origDemand, err := getDemand(appA)
+			Expect(err).NotTo(HaveOccurred())
+			if origDemand == "" {
+				origDemand = baselineDemand
+			}
+
+			DeferCleanup(func() {
+				By("restoring app-a's nodeSelector, admission-timeout, demand, and " + node + "'s capacity")
+				Expect(restoreNodeSelector(appA, origSelector)).To(Succeed())
+				Expect(setOrClearAnnotation(appA, admissionTimeoutKey, origTimeout)).To(Succeed())
+				Expect(setDemand(appA, origDemand)).To(Succeed())
+				Expect(setNodeCapacity(node, 4)).To(Succeed())
+			})
+
+			By(fmt.Sprintf("zeroing %s's leasable GPU count", node))
+			Expect(setNodeCapacity(node, 0)).To(Succeed())
+
+			By("pinning app-a to " + node + " and shortening its admission-timeout")
+			Expect(setNodeSelectorHostname(appA, node)).To(Succeed())
+			Expect(setOrClearAnnotation(appA, admissionTimeoutKey, "20s")).To(Succeed())
+
+			By("raising app-a's demand so the WarmPool reconciler must attempt a promotion")
+			Expect(setDemand(appA, "80")).To(Succeed())
+
+			By("waiting for a GPULease or event with reason NoFreeGPUOnAnyPodNode")
+			Eventually(func() bool {
+				return gpuLeaseFailedWithReason(gpuleasev1alpha1.ReasonNoFreeGPUOnAnyPodNode) ||
+					eventWithReason(gpuleasev1alpha1.ReasonNoFreeGPUOnAnyPodNode)
+			}, "180s", "3s").Should(BeTrue(),
+				"expected a Failed GPULease or Event with reason NoFreeGPUOnAnyPodNode for app-a")
+
+			By("asserting no app-a pod crash-looped while pinned to a GPU-less node")
+			Expect(noPodCrashLooping(appA)).To(BeTrue())
+		})
 	})
 })
-
-// serviceAccountToken returns a token for the specified service account in the given namespace.
-// It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
-// and parsing the resulting token from the API response.
-func serviceAccountToken() (string, error) {
-	const tokenRequestRawString = `{
-		"apiVersion": "authentication.k8s.io/v1",
-		"kind": "TokenRequest"
-	}`
-
-	// Temporary file to store the token request
-	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
-	tokenRequestFile := filepath.Join("/tmp", secretName)
-	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
-	if err != nil {
-		return "", err
-	}
-
-	var out string
-	verifyTokenCreation := func(g Gomega) {
-		// Execute kubectl command to create the token
-		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
-			"/api/v1/namespaces/%s/serviceaccounts/%s/token",
-			namespace,
-			serviceAccountName,
-		), "-f", tokenRequestFile)
-
-		output, err := cmd.CombinedOutput()
-		g.Expect(err).NotTo(HaveOccurred())
-
-		// Parse the JSON output to extract the token
-		var token tokenRequest
-		err = json.Unmarshal(output, &token)
-		g.Expect(err).NotTo(HaveOccurred())
-
-		out = token.Status.Token
-	}
-	Eventually(verifyTokenCreation).Should(Succeed())
-
-	return out, err
-}
-
-// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
-func getMetricsOutput() string {
-	By("getting the curl-metrics logs")
-	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-	metricsOutput, err := utils.Run(cmd)
-	Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-	Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
-	return metricsOutput
-}
-
-// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
-// containing only the token field that we need to extract.
-type tokenRequest struct {
-	Status struct {
-		Token string `json:"token"`
-	} `json:"status"`
-}

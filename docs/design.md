@@ -372,11 +372,30 @@ triggers:
   metadata:
     serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
     query: |
-      (max by (deployment) (gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0))
+      (max(gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0))
       + (2 * 10)
     threshold: "10"             # = pod-capacity-rps
     activationThreshold: "0"
 ```
+
+Note the aggregation is `max(...)` with **no** `by (deployment)` clause, even though the metric
+selector already pins `deployment="app-a"`. This is deliberate, not a simplification: PromQL's `or`
+only drops `vector(0)`'s result when its label set exactly equals a left-hand series's label set
+(default vector matching = all labels). `vector(0)` always yields one series with an **empty**
+label set `{}`. `max(...)` with no `by` also collapses to `{}` (since the query is already scoped
+to one deployment, no grouping is needed to get down to a single series), so once real data
+exists the two `{}` series match and `or` correctly drops `vector(0)`. `max by (deployment) (...)`
+instead yields `{deployment="app-a"}`, which is never equal to `{}` — so `or vector(0)` never
+suppresses, and once the metric has data **both** series survive into `+ (2 * 10)` (broadcast over
+every element), producing two results. KEDA's Prometheus scaler rejects any query returning more
+than one element (`"...returned multiple elements"`), which surfaces as the ScaledObject's
+`TriggerError`/`FailedGetExternalMetric` conditions and `kubectl get hpa` showing `<unknown>` —
+this is exactly the failure this PoC hit when the query was first written with `by (deployment)`
+here; see `deploy/keda/scaledobject-app-a.yaml` for the fixed, deployed version and the same
+reasoning restated there. The `max by (deployment)` form is still correct — and required — for the
+*unscoped, cross-deployment* reference queries in `docs/demo.md` (e.g. Grafana panels querying all
+deployments at once), since those need the grouping to keep app-a/app-b as separate series; it is
+only wrong here because this query is already filtered down to a single deployment.
 
 With `metricType: AverageValue` the HPA computes `ceil(metricValue / threshold)`, so
 
@@ -400,10 +419,11 @@ cmd/workload/main.go          simulator binary
 internal/controller/          warmpool_controller.go, gpulease_controller.go,
                               inventory.go, kueue.go, metrics.go, podclient/
 internal/workload/            server.go, state.go, demand.go, metrics.go
-config/                       kustomize: crd, rbac, manager, samples (kubebuilder-generated)
+config/                       kustomize: crd, rbac, manager, prometheus, samples (kubebuilder-generated)
 deploy/kueue/                 resource-flavors.yaml, cluster-queue.yaml, local-queues.yaml
 deploy/apps/                  app-a.yaml, app-b.yaml, services, servicemonitors, demand-cm.yaml
 deploy/keda/                  scaledobject-app-a.yaml, scaledobject-app-b.yaml
+deploy/monitoring/            prometheus-metrics-reader-binding.yaml
 hack/setup-nodes.sh           node labels + capacity + generates cluster-queue.yaml
 hack/kind-load.sh  hack/demo.sh  hack/watch.sh
 test/e2e/                     scenario test
@@ -422,6 +442,31 @@ exposes its own metrics + a ServiceMonitor:
 - `gpulease_leases_active{node}` / `gpulease_node_gpus_free{node}`
 - `gpulease_lease_acquire_failures_total{deployment,reason}`
 - `gpulease_promotions_total` / `gpulease_demotions_total`
+
+The metrics endpoint is the kubebuilder-scaffolded secure default: HTTPS on `:8443`,
+authenticated via `TokenReview` and authorized via `SubjectAccessReview` against the
+nonResourceURL `/metrics` (`cmd/manager/main.go`, controller-runtime's
+`filters.WithAuthenticationAndAuthorization` — the same posture kube-rbac-proxy used to
+provide). This means enabling the ServiceMonitor alone (`config/prometheus/monitor.yaml`,
+pulled in by `config/default/kustomization.yaml`'s `- ../prometheus`) is not sufficient:
+the scraper also needs a `SubjectAccessReview`-authorized identity. The ServiceMonitor
+already has Prometheus present its own pod's ServiceAccount token
+(`bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token`); what's missing
+from the kubebuilder scaffold is binding that ServiceAccount to the scaffolded
+`metrics-reader` `ClusterRole` (`config/rbac/metrics_reader_role.yaml` — nonResourceURLs:
+`["/metrics"]`, verbs: `["get"]`), which nothing does by default. `deploy/monitoring/
+prometheus-metrics-reader-binding.yaml` is that missing `ClusterRoleBinding`, granting it
+to kube-prometheus-stack's Prometheus ServiceAccount (`prometheus-kube-prometheus-
+prometheus`, namespace `monitoring`). It is applied directly (`kubectl apply -f`), not
+folded into `config/default`'s kustomize tree: that tree's `namespace:
+gpu-lease-scaffold-system` transform unconditionally rewrites `ClusterRoleBinding`
+subjects' `namespace:` field (verified against the scaffolded `metrics_auth_role_binding.yaml`,
+whose placeholder subject namespace `system` is rewritten the same way), which would
+silently clobber a subject that is deliberately in the external `monitoring` namespace.
+Without this binding the ServiceMonitor has a scrape target but every scrape is
+`401`/`403`'d and the four metric families above never have data — this exact gap is what
+caused `hack/demo.sh`'s steps 6/7 `gpulease_lease_acquire_failures_total` checks to see no
+data before it was fixed (see the comment above `prom_query()` in `hack/demo.sh`).
 
 ## 8. Delivery phases
 

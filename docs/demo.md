@@ -38,9 +38,18 @@ docker build -t gpu-lease-workload:dev -f cmd/workload/Dockerfile .   # or `make
 kind load docker-image gpu-lease-controller:dev --name kind-wva-gpu-cluster
 kind load docker-image gpu-lease-workload:dev   --name kind-wva-gpu-cluster
 
-# 4. GPULease CRD + controller
+# 4. GPULease CRD + controller (also applies the controller's own ServiceMonitor --
+#    config/default/kustomization.yaml includes ../prometheus)
 make install    # applies config/crd
 make deploy IMG=gpu-lease-controller:dev
+
+# 4b. Grant kube-prometheus-stack's Prometheus ServiceAccount permission to read the
+#     controller's secured (HTTPS + bearer-token) /metrics endpoint -- without this,
+#     the ServiceMonitor from step 4 has a scrape target but every scrape 403s, and
+#     gpulease_pool_hot_pods/_warm_pods, gpulease_lease_acquire_failures_total, etc.
+#     (design.md §7) never have data. See the comment header in the file for why this
+#     is applied directly rather than folded into config/default's kustomize tree.
+kubectl apply -f deploy/monitoring/prometheus-metrics-reader-binding.yaml
 
 # 5. app-a / app-b Deployments, Services, ServiceMonitors, the demand ConfigMap
 kubectl apply -f deploy/apps/
@@ -56,6 +65,10 @@ Verify before moving on:
 kubectl get pods -n gpu-lease-poc
 kubectl get scaledobject -n gpu-lease-poc
 kubectl get hpa -n gpu-lease-poc
+
+# controller's own metrics are being scraped (design.md §7) -- if this ServiceMonitor's
+# target isn't "up" in Prometheus, step 4b above (the ClusterRoleBinding) is missing
+kubectl get servicemonitor -n gpu-lease-scaffold-system
 ```
 
 ## Live dashboard
@@ -218,7 +231,11 @@ max by (deployment) (gpulease_demand_rps{namespace="gpu-lease-poc"})
 sum by (deployment) (gpulease_pod_capacity_rps{namespace="gpu-lease-poc"})
 
 # the exact value KEDA's trigger is scaling on (demand + fixed overprovision term)
-(max by (deployment) (gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0)) + (2 * 10)
+# NOTE: no `by (deployment)` here, unlike the queries above -- this one is already
+# scoped to a single deployment via the label matcher, and pairing `by (deployment)`
+# with `or vector(0)` on an already-scoped query returns 2 elements once real data
+# exists (KEDA rejects that as "returned multiple elements") -- see design.md §6.
+(max(gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0)) + (2 * 10)
 
 # hot vs warm pod counts over time (controller-exposed, design.md §7)
 gpulease_pool_hot_pods{namespace="gpu-lease-poc"}
@@ -265,6 +282,17 @@ CRDs/KEDA are untouched) brings the demo back.
     do its pods pass their readiness probe)?
   - Check Prometheus's own target page (port-forward Prometheus as above, then open
     `/targets` in a browser) for the scrape error message.
+
+**Controller-side metrics (`gpulease_pool_hot_pods`, `gpulease_lease_acquire_failures_total`, ...)
+show no data even though the ServiceMonitor target is `up`**
+
+- Actually check whether the target is `up`, not just present — the controller's `/metrics` is
+  HTTPS + bearer-token authenticated (design.md §7). If the target's health is
+  `down`/`4xx`/`5xx` (not just missing), Prometheus's own ServiceAccount is not authorized to read
+  it: `kubectl get clusterrolebinding gpu-lease-poc-prometheus-metrics-reader` should exist (see
+  `deploy/monitoring/prometheus-metrics-reader-binding.yaml`) — re-apply it if missing.
+- If the target isn't listed at all, `config/default/kustomization.yaml`'s `- ../prometheus` line
+  must be uncommented and `make deploy` re-run.
 
 **A `GPULease` is stuck in `Pending`**
 

@@ -1,0 +1,42 @@
+# Grants kube-prometheus-stack's Prometheus ServiceAccount permission to scrape the
+# GPULease controller-manager's own /metrics endpoint.
+#
+# Why this exists (design.md §7/§9; found while running hack/demo.sh for Phase 6):
+# the controller serves its metrics securely by default (cmd/manager/main.go,
+# --metrics-secure=true -- HTTPS on :8443, guarded by controller-runtime's
+# filters.WithAuthenticationAndAuthorization: bearer-token authn via TokenReview +
+# authz via SubjectAccessReview against the nonResourceURL "/metrics"). The kubebuilder
+# scaffold under config/prometheus/monitor.yaml (enabled via config/default/
+# kustomization.yaml's `- ../prometheus`) already points Prometheus at that endpoint
+# with `bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token` -- i.e.
+# Prometheus authenticates as ITSELF using its own pod's ServiceAccount token -- but
+# nothing grants that ServiceAccount's identity permission to pass the
+# SubjectAccessReview. config/rbac/metrics_reader_role.yaml scaffolds exactly the
+# ClusterRole needed (nonResourceURLs: ["/metrics"], verbs: ["get"]) but nothing binds
+# it to anyone; this file is that missing binding.
+#
+# Deliberately kept OUT of config/default's kustomize tree (and out of
+# config/rbac/kustomization.yaml): that tree applies `namespace: gpu-lease-scaffold-
+# system` as a blanket kustomize namespace transform, which rewrites
+# ClusterRoleBinding subjects' `namespace:` field unconditionally (verified: the
+# scaffolded metrics_auth_role_binding.yaml's subject namespace "system" is rewritten
+# to "gpu-lease-scaffold-system" by that same transform) -- so a binding whose subject
+# lives in the monitoring namespace would have its subject namespace silently
+# clobbered to gpu-lease-scaffold-system if it were included there instead. Applied
+# directly (kubectl apply -f), same convention as deploy/kueue, deploy/apps,
+# deploy/keda. Cluster-scoped; does not create/modify/delete anything IN the
+# `monitoring` namespace -- it only references, as a subject, a ServiceAccount that
+# already lives there (prometheus-kube-prometheus-prometheus, kube-prometheus-stack's
+# default Prometheus SA name in this cluster).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpu-lease-poc-prometheus-metrics-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gpu-lease-scaffold-metrics-reader
+subjects:
+- kind: ServiceAccount
+  name: prometheus-kube-prometheus-prometheus
+  namespace: monitoring

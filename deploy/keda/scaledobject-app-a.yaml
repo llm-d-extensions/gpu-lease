@@ -37,6 +37,25 @@
 # series makes the Prometheus trigger return no data, which KEDA treats as an error on
 # the trigger (surfaces as the ScaledObject's Active/Ready conditions flapping and the
 # HPA showing <unknown> for the external metric) rather than "demand is currently 0".
+#
+# The aggregation is deliberately `max(...)` with NO `by (deployment)` clause, even
+# though the metric carries a deployment label: this query's metric selector already
+# pins deployment="app-a", so at most one series can ever match, and `max(...)`
+# (no `by`) collapses it to a single series with an *empty* label set `{}`. That
+# matters for `or vector(0)`: PromQL's `or` only drops the right-hand operand's
+# series when its label set exactly equals a left-hand series's label set (default
+# vector matching = "on" all labels). `vector(0)` always produces one series with `{}`
+# labels. `max by (deployment) (...)` would instead produce `{deployment="app-a"}`,
+# which never equals `{}` -- so `or vector(0)` never gets suppressed once real data
+# exists, and BOTH series (the real one and vector(0)'s 0) survive into `+ (2 * 10)`,
+# which broadcasts over every element and returns two results. KEDA's Prometheus
+# scaler rejects any query returning more than one element
+# ("returned multiple elements"), which is exactly the failure this caused in
+# practice: `kubectl get hpa` showed <unknown> and the keda-operator log had
+# `error executing prometheus query ... returned multiple elements`. Keep this as
+# `max(...)` with no `by` clause; do not "restore" a `by (deployment)` grouping here
+# even though the reference PromQL in docs/demo.md (which is NOT pre-filtered to one
+# deployment) correctly uses one.
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -75,7 +94,7 @@ spec:
     metadata:
       serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
       query: |
-        (max by (deployment) (gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0))
+        (max(gpulease_demand_rps{namespace="gpu-lease-poc",deployment="app-a"}) or vector(0))
         + (2 * 10)
       threshold: "10"
       activationThreshold: "0"

@@ -24,7 +24,12 @@ resources:
 # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER'. 'WEBHOOK' components are required.
 #- ../certmanager
 # [PROMETHEUS] To enable prometheus monitor, uncomment all sections with 'PROMETHEUS'.
-#- ../prometheus
+# Enabled for this PoC: design.md §7/§9 requires the controller's own metrics
+# (gpulease_pool_hot_pods, gpulease_lease_acquire_failures_total, etc.) to be scraped --
+# without this, they never have a scrape target at all (see deploy/monitoring/
+# prometheus-metrics-reader-binding.yaml for the matching RBAC grant kube-prometheus-
+# stack's Prometheus needs to read the resulting HTTPS+bearer-auth endpoint).
+- ../prometheus
 # [METRICS] Expose the controller manager metrics service.
 - metrics_service.yaml
 # [NETWORK POLICY] Protect the /metrics endpoint and Webhook Server with NetworkPolicy.

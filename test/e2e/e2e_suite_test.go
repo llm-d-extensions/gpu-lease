@@ -18,72 +18,129 @@ package e2e
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"testing"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	. "github.com/onsi/ginkgo/v2" //nolint:golint,revive
+	. "github.com/onsi/gomega"    //nolint:golint,revive
 
 	"github.com/llm-d-extensions/gpu-lease/test/utils"
 )
 
-var (
-	// Optional Environment Variables:
-	// - CERT_MANAGER_INSTALL_SKIP=true: Skips CertManager installation during test setup.
-	// These variables are useful if CertManager is already installed, avoiding
-	// re-installation and conflicts.
-	skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
-	// isCertManagerAlreadyInstalled will be set true when CertManager CRDs be found on the cluster
-	isCertManagerAlreadyInstalled = false
+// This suite deliberately does NOT follow the kubebuilder scaffold's default e2e
+// pattern (build a throwaway image, kind-load it, install/uninstall CertManager,
+// create/delete the controller's own namespace). Those steps assume a disposable,
+// self-provisioned test environment. This repo's actual e2e story (design.md §2/§9,
+// docs/demo.md) is the opposite: a single shared kind cluster
+// (kind-wva-gpu-cluster) that already has Kueue, KEDA, kube-prometheus-stack, and
+// this PoC's own controller/CRD/Deployments installed and running in their
+// steady-state configuration (see hack/demo.sh step 1) -- reinstalling any of that
+// here would either collide with what's already there or be actively wrong (a
+// throwaway image tagged "example.com/gpu-lease-scaffold:v0.0.1" is not
+// gpu-lease-controller:dev, and CertManager is not part of this PoC's stack at all;
+// see docs/design.md §3/§4.5).
+//
+// So instead of provisioning anything, BeforeSuite only verifies the live
+// environment already looks like the one docs/demo.md's install order produces,
+// and Skip()s the whole suite with an actionable message if not. That keeps this
+// runnable in two situations without any code path that could reinstall over, or
+// tear down, someone else's running demo:
+//   - the intended one: `make test-e2e` (or `go test ./test/e2e/`) against the
+//     already-deployed kind-wva-gpu-cluster, after following docs/demo.md's
+//     install order;
+//   - a CI/sandbox run with no such cluster reachable: the suite Skips cleanly
+//     instead of failing or trying to build/deploy anything.
+//
+// `make test` (envtest) never reaches this file at all: its test target filters
+// `go list ./... | grep -v /e2e` (Makefile), so this package is excluded
+// structurally, not just by a runtime guard -- the BeforeSuite guard below is a
+// second, independent line of defense for anyone who runs `go test ./...`
+// directly instead of via `make test`.
+const (
+	// pocNamespace is where the app-a/app-b Deployments, GPULeases' claimed pods,
+	// the demand ConfigMap, and Kueue's LocalQueues/Workloads for this PoC live
+	// (deploy/apps/, deploy/kueue/local-queues.yaml).
+	pocNamespace = "gpu-lease-poc"
 
-	// projectImage is the name of the image which will be build and loaded
-	// with the code source changes to be tested.
-	projectImage = "example.com/gpu-lease-scaffold:v0.0.1"
+	// controllerNamespace is where `make deploy` puts the GPULease
+	// controller-manager (config/default's kustomize namespace prefix).
+	controllerNamespace = "gpu-lease-scaffold-system"
+
+	// gpuLeaseCRDName is the cluster-scoped CRD this suite requires to already be
+	// installed (`make install`, config/crd).
+	gpuLeaseCRDName = "gpuleases.poc.llm-d.ai"
 )
 
-// TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,
-// temporary environment to validate project changes with the the purposed to be used in CI jobs.
-// The default setup requires Kind, builds/loads the Manager Docker image locally, and installs
-// CertManager.
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
-	_, _ = fmt.Fprintf(GinkgoWriter, "Starting gpu-lease-scaffold integration test suite\n")
+	_, _ = fmt.Fprintf(GinkgoWriter, "Starting gpu-lease PoC e2e suite\n")
 	RunSpecs(t, "e2e suite")
 }
 
 var _ = BeforeSuite(func() {
-	By("building the manager(Operator) image")
-	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))
+	skipUnless(clusterReachable, "no Kubernetes cluster reachable via the current kubeconfig context")
+	skipUnless(crdInstalled(gpuLeaseCRDName),
+		fmt.Sprintf("CRD %s is not installed -- run `make install` per docs/demo.md's install order", gpuLeaseCRDName))
+	skipUnless(namespaceExists(controllerNamespace),
+		fmt.Sprintf("namespace %s does not exist -- run `make deploy` per docs/demo.md", controllerNamespace))
+	skipUnless(deploymentAvailable(controllerNamespace, "gpu-lease-scaffold-controller-manager"),
+		"the GPULease controller-manager Deployment is not Available -- check `make deploy` succeeded and "+
+			"`kubectl -n "+controllerNamespace+" get pods`")
+	skipUnless(namespaceExists(pocNamespace),
+		fmt.Sprintf("namespace %s does not exist -- apply deploy/apps/, deploy/kueue/, deploy/keda/ per docs/demo.md", pocNamespace))
+	for _, dep := range []string{appA, appB} {
+		skipUnless(deploymentAvailable(pocNamespace, dep),
+			fmt.Sprintf("Deployment %s/%s is not Available -- apply deploy/apps/ per docs/demo.md", pocNamespace, dep))
+	}
+	skipUnless(configMapExists(pocNamespace, demandConfigMap),
+		fmt.Sprintf("ConfigMap %s/%s (demand) does not exist -- apply deploy/apps/ per docs/demo.md", pocNamespace, demandConfigMap))
+
+	// Baseline steady state (design.md §9 criterion 1 / hack/demo.sh step1): both
+	// tests below mutate one deployment's demand/nodeSelector/labels temporarily
+	// and restore them via DeferCleanup, but they still need to start from
+	// something converged, or their own polling assertions have no stable
+	// baseline to diff against.
+	Expect(setDemand(appA, baselineDemand)).To(Succeed())
+	Expect(setDemand(appB, baselineDemand)).To(Succeed())
+	Eventually(func() [2]int { return hotWarmCounts(appA) }, "90s", "3s").Should(Equal([2]int{2, 2}),
+		"app-a did not reach the 2 hot + 2 warm baseline before the suite started")
+	Eventually(func() [2]int { return hotWarmCounts(appB) }, "90s", "3s").Should(Equal([2]int{2, 2}),
+		"app-b did not reach the 2 hot + 2 warm baseline before the suite started")
+})
+
+func skipUnless(cond bool, reason string) {
+	if !cond {
+		Skip(reason)
+	}
+}
+
+var clusterReachable = func() bool {
+	cmd := exec.Command("kubectl", "cluster-info")
 	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager(Operator) image")
+	return err == nil
+}()
 
-	// TODO(user): If you want to change the e2e test vendor from Kind, ensure the image is
-	// built and available before running the tests. Also, remove the following block.
-	By("loading the manager(Operator) image on Kind")
-	err = utils.LoadImageToKindClusterWithName(projectImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
+func crdInstalled(name string) bool {
+	cmd := exec.Command("kubectl", "get", "crd", name)
+	_, err := utils.Run(cmd)
+	return err == nil
+}
 
-	// The tests-e2e are intended to run on a temporary cluster that is created and destroyed for testing.
-	// To prevent errors when tests run in environments with CertManager already installed,
-	// we check for its presence before execution.
-	// Setup CertManager before the suite if not skipped and if not already installed
-	if !skipCertManagerInstall {
-		By("checking if cert manager is installed already")
-		isCertManagerAlreadyInstalled = utils.IsCertManagerCRDsInstalled()
-		if !isCertManagerAlreadyInstalled {
-			_, _ = fmt.Fprintf(GinkgoWriter, "Installing CertManager...\n")
-			Expect(utils.InstallCertManager()).To(Succeed(), "Failed to install CertManager")
-		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: CertManager is already installed. Skipping installation...\n")
-		}
-	}
-})
+func namespaceExists(ns string) bool {
+	cmd := exec.Command("kubectl", "get", "namespace", ns)
+	_, err := utils.Run(cmd)
+	return err == nil
+}
 
-var _ = AfterSuite(func() {
-	// Teardown CertManager after the suite if not skipped and if it was not already installed
-	if !skipCertManagerInstall && !isCertManagerAlreadyInstalled {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling CertManager...\n")
-		utils.UninstallCertManager()
-	}
-})
+func configMapExists(ns, name string) bool {
+	cmd := exec.Command("kubectl", "get", "configmap", name, "-n", ns)
+	_, err := utils.Run(cmd)
+	return err == nil
+}
+
+func deploymentAvailable(ns, name string) bool {
+	cmd := exec.Command("kubectl", "get", "deployment", name, "-n", ns,
+		"-o", "jsonpath={.status.conditions[?(@.type==\"Available\")].status}")
+	out, err := utils.Run(cmd)
+	return err == nil && out == "True"
+}
